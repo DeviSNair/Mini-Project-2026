@@ -1,0 +1,125 @@
+{
+  "identity": {
+    "persona": "E1: The Anti-AI Designer",
+    "mission": "Create a visceral, culturally rich travel planner for Trivandrum that feels like a journey, not a spreadsheet.",
+    "values": ["Fusion over Imitation", "Emotion First", "Content is King", "Zoom In", "Negative Space"]
+  },
+  "theme": {
+    "mode": "light",
+    "reasoning": "Kerala is 'God's Own Country' - lush, sunny, and vibrant. A light theme with organic earthy tones captures the tropical essence better than a tech-heavy dark mode."
+  },
+  "typography": {
+    "primary_font": "DM Sans",
+    "secondary_font": "Playfair Display",
+    "import_url": "https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,100..1000&family=Playfair+Display:ital,wght@0,400..900;1,400..900&display=swap",
+    "usage": {
+      "headings": "Playfair Display",
+      "body": "DM Sans",
+      "ui_elements": "DM Sans"
+    }
+  },
+  "colors": {
+    "palette": {
+      "primary": "#004D40",
+      "secondary": "#FFB300",
+      "accent": "#FF5722",
+      "background": "#FDFBF7",
+      "surface": "#FFFFFF",
+      "text_primary": "#1A1A1A",
+      "text_secondary": "#5C5C5C",
+      "border": "#E5E0D8"
+    },
+    "semantic": {
+      "brand": "#004D40",
+      "success": "#2E7D32",
+      "warning": "#FBC02D",
+      "error": "#D32F2F",
+      "info": "#0288D1"
+    }
+  },
+  "visual_enhancers": {
+    "border_radius": {
+      "sm": "4px",
+      "md": "8px",
+      "lg": "16px",
+      "xl": "24px"
+    },
+    "shadows": {
+      "card": "0 4px 20px rgba(0, 77, 64, 0.08)",
+      "floating": "0 12px 40px rgba(0, 0, 0, 0.12)"
+    },
+    "gradients": {
+      "hero_overlay": "linear-gradient(to bottom, rgba(0,77,64,0.4), rgba(0,77,64,0.8))",
+      "warm_glow": "radial-gradient(circle at top right, rgba(255,179,0,0.15), transparent 60%)"
+    },
+    "textures": "Use subtle grain or paper texture overlays on solid backgrounds to avoid 'digital flatness'."
+  },
+  "layout_strategies": {
+    "landing_page": {
+      "hero": "Full-height cinematic hero with 'Playfair Display' headlines. Asymmetrical layout - text bottom-left, massive image usage.",
+      "features": "Zig-zag layout with large imagery and ample whitespace."
+    },
+    "explore_page": {
+      "grid_style": "Bento Grid (Mode A). Mix of tall (vertical), square, and wide cards. Never a uniform grid.",
+      "filters": "Horizontal scrollable pill list (Shadcn ScrollArea) with distinct active states."
+    },
+    "place_card": {
+      "style": "Minimalist 'Polaroid' or 'Ticket' feel. Image dominates (70% height). Title and category distinct. Add to Cart button is a floating icon button on the image corner.",
+      "interaction": "Scale up slightly on hover. Shadow deepens."
+    },
+    "cart_system": {
+      "desktop": "Slide-over drawer from right (Sheet component).",
+      "mobile": "Sticky bottom bar showing item count and total cost with 'View Cart' CTA."
+    }
+  },
+  "components": {
+    "buttons": {
+      "primary": "Solid #004D40, rounded-full, uppercase tracking-wide, Playfair Display or DM Sans Bold.",
+      "secondary": "Outline #004D40, rounded-full."
+    },
+    "inputs": {
+      "style": "Underlined or minimal borders. No heavy grey backgrounds. Focus state: #FFB300 ring."
+    },
+    "navigation": {
+      "style": "Floating glassmorphism navbar (Blur-lg, bg-white/70). Logo left, minimal links right. Cart icon prominent."
+    }
+  },
+  "motion": {
+    "library": "framer-motion",
+    "guidelines": [
+      "Staggered entrance for list items.",
+      "Smooth layout transitions (layoutId) for expanding cards.",
+      "Parallax effect on Hero images.",
+      "Micro-interactions on buttons (tap scale 0.95)."
+    ]
+  },
+  "images": {
+    "hero": "https://images.unsplash.com/photo-1642219236097-ac751378a901",
+    "temples": "https://images.unsplash.com/photo-1644773182167-0d302480d813",
+    "beaches": "https://images.unsplash.com/photo-1695030744519-3f3042b3af26",
+    "museums": "https://images.pexels.com/photos/19934600/pexels-photo-19934600.jpeg",
+    "food": "https://images.pexels.com/photos/14132112/pexels-photo-14132112.jpeg",
+    "culture": "https://images.pexels.com/photos/32542538/pexels-photo-32542538.jpeg"
+  },
+  "image_credits": {
+    "Unsplash": ["1642219236097", "1644773182167", "1695030744519"],
+    "Pexels": ["19934600", "14132112", "32542538"]
+  },
+  "instructions_to_main_agent": [
+    "DO NOT use generic travel icons. Use Lucide icons with thin strokes.",
+    "Implement a 'Smart Itinerary' view that looks like a vertical timeline journey.",
+    "Use 'sonner' for all toast notifications (Added to cart, Generated).",
+    "Ensure the 'Explore' page uses the Bento Grid layout defined above.",
+    "For the Cart persistence, use a custom hook `useCart` that syncs with localStorage.",
+    "The itinerary generator should visually group places by proximity (North vs South Trivandrum).",
+    "Use the provided image URLs for placeholders. Do NOT leave images blank."
+  ],
+  "UNIVERSAL_GUIDELINES": [
+    "Avoid 'AI Slop' - generic centered layouts.",
+    "Use 2-3x more spacing (p-8, p-12) than standard.",
+    "Dark colors look good when used independently without gradients.",
+    "Create depth through layered design elements with z-index hierarchy.",
+    "Use glass-morphism effects with backdrop filters.",
+    "Add data-testid to all interactive elements."
+  ]
+}
