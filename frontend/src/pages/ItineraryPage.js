@@ -3,6 +3,7 @@ import { motion } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
 import { Download, MapPin, Clock, DollarSign, Calendar, ChevronRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { PlaceImage } from '@/components/PlaceImage';
 import { jsPDF } from 'jspdf';
 import { toast } from 'sonner';
 
@@ -253,9 +254,8 @@ export const ItineraryPage = () => {
                     data-testid={`place-${place.id}`}
                   >
                     <div className="flex gap-4">
-                      <img
-                        src={place.image_url}
-                        alt={place.name}
+                      <PlaceImage
+                        place={place}
                         className="w-24 h-24 object-cover rounded-xl"
                       />
                       <div className="flex-1">
@@ -314,7 +314,7 @@ export const ItineraryPage = () => {
                   className="bg-white rounded-2xl overflow-hidden card-shadow hover:floating-shadow transition-all"
                   data-testid={`recommendation-${place.id}`}
                 >
-                  <img src={place.image_url} alt={place.name} className="w-full h-40 object-cover" />
+                  <PlaceImage place={place} className="w-full h-40 object-cover" />
                   <div className="p-4">
                     <h4 className="font-bold text-[#1A1A1A] mb-1">{place.name}</h4>
                     <p className="text-sm text-[#5C5C5C]">{place.area}</p>

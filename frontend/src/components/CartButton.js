@@ -2,6 +2,7 @@ import { motion } from 'framer-motion';
 import { ShoppingCart, X } from 'lucide-react';
 import { useCart } from '@/context/CartContext';
 import { Button } from '@/components/ui/button';
+import { PlaceImage } from '@/components/PlaceImage';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useNavigate } from 'react-router-dom';
@@ -54,9 +55,8 @@ export const CartButton = () => {
                   className="bg-white rounded-lg p-4 card-shadow flex gap-4"
                   data-testid={`cart-item-${place.id}`}
                 >
-                  <img
-                    src={place.image_url}
-                    alt={place.name}
+                  <PlaceImage
+                    place={place}
                     className="w-20 h-20 object-cover rounded-lg"
                   />
                   <div className="flex-1">

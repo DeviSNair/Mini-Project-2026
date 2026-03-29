@@ -1,45 +1,43 @@
-from fastapi import FastAPI, APIRouter, HTTPException
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from collections import Counter
+import math
 import os
-import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+import re
+from typing import Dict, List, Optional
 import uuid
-from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+from fastapi import APIRouter, FastAPI, HTTPException
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
+from starlette.middleware.cors import CORSMiddleware
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
+# --- Database Connection ---
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+db_name = os.environ.get('DB_NAME', 'trivandrum_trails')
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+db = client[db_name]
 
-# Create the main app without a prefix
 app = FastAPI()
+api_router = APIRouter()
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+INTEREST_CATEGORY_MAP = {
+    'Beaches & Nature': {'beach': 2.4, 'nature': 2.2},
+    'Historical Sites & Temples': {'temple': 2.3, 'heritage': 1.7, 'church': 1.1, 'mosque': 1.1, 'culture': 1.0},
+    'Cafes & Restaurants': {'food': 2.1},
+    'Shopping & Local Markets': {'market': 1.9, 'street': 1.2},
+    'Parks & Museums': {'heritage': 1.5, 'culture': 1.5, 'nature': 0.8},
+    'Adventure & Outdoor Activities': {'nature': 1.7, 'beach': 1.1, 'street': 0.6},
+}
 
-# Define Models
-class Place(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
-    category: str
-    area: str
-    description: str
-    top: bool = False
-    hidden: bool = False
-    type: Optional[str] = None
-    cost: int
-    duration: float
-    coordinates: List[float]
-    image_url: str
+GENERIC_SURVEY_WORDS = {'no', 'nil', 'none', 'na', 'nothing', 'nope'}
+FOOD_CATEGORY = 'food'
+
+
+# --- Data Models ---
 
 class PlaceResponse(BaseModel):
     id: str
@@ -49,17 +47,20 @@ class PlaceResponse(BaseModel):
     description: str
     top: bool
     hidden: bool
-    type: Optional[str]
+    type: Optional[str] = None
     cost: int
     duration: float
     coordinates: List[float]
     image_url: str
+
 
 class ItineraryRequest(BaseModel):
     place_ids: List[str]
     days: int
     budget: int
     preference: str = "balanced"
+    is_auto_generated: Optional[bool] = False
+
 
 class DayItinerary(BaseModel):
     day: int
@@ -67,16 +68,465 @@ class DayItinerary(BaseModel):
     total_cost: int
     total_duration: float
 
+
 class ItineraryResponse(BaseModel):
     days: List[DayItinerary]
     total_cost: int
     total_duration: float
     recommendations: List[PlaceResponse]
 
-# Routes
-@api_router.get("/")
-async def root():
-    return {"message": "Trivandrum Travel Planner API"}
+
+def normalize_text(value: Optional[str]) -> str:
+    return re.sub(r'[^a-z0-9]+', ' ', (value or '').lower()).strip()
+
+
+def parse_hidden_gem_value(value: Optional[str]) -> int:
+    if not value:
+        return 3
+    match = re.search(r'(\d+)', str(value))
+    if not match:
+        return 3
+    return int(match.group(1))
+
+
+def calculate_distance(first: Optional[List[float]], second: Optional[List[float]]) -> float:
+    if not first or not second or len(first) < 2 or len(second) < 2:
+        return 0.0
+
+    lat1, lon1 = first
+    lat2, lon2 = second
+    radius = 6371
+
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(delta_lon / 2) ** 2
+    )
+    return radius * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+
+def travel_settings(preference: str, survey_profile: Dict[str, object]) -> Dict[str, float]:
+    quality_bias = float(survey_profile.get('quality_bias', 0.6))
+    experience_bias = float(survey_profile.get('experience_bias', 0.6))
+
+    if preference == 'relaxed':
+        hours_per_day = 6.5
+        target_stops = 2 if quality_bias >= 0.45 else 3
+    elif preference == 'discovery':
+        hours_per_day = 8.5
+        target_stops = 3 if quality_bias >= 0.45 else 4
+    else:
+        hours_per_day = 7.5
+        target_stops = 3
+
+    return {
+        'hours_per_day': hours_per_day,
+        'target_stops': target_stops,
+        'hard_stop_limit': target_stops + (1 if preference == 'discovery' else 0),
+        'soft_stop_hours': hours_per_day * 0.75,
+        'seed_penalty': 0.08 if experience_bias >= 0.55 else 0.14,
+        'hop_penalty': 0.1 if experience_bias >= 0.55 else 0.16,
+    }
+
+
+async def get_survey_profile() -> Dict[str, object]:
+    responses = await db.responses.find({}, {'_id': 0}).to_list(500)
+    if not responses:
+        return {
+            'category_weights': {},
+            'hidden_gem_bias': 0.6,
+            'quality_bias': 0.6,
+            'experience_bias': 0.6,
+            'suggestion_terms': Counter(),
+            'tourist_trap_terms': Counter(),
+        }
+
+    category_votes: Counter = Counter()
+    suggestion_terms: Counter = Counter()
+    tourist_trap_terms: Counter = Counter()
+    hidden_gem_votes: List[int] = []
+    itinerary_style_counter: Counter = Counter()
+    route_priority_counter: Counter = Counter()
+
+    for response in responses:
+        preferences = response.get('preferences', {})
+        behavior = response.get('behavior', {})
+        feedback = response.get('feedback', {})
+
+        for interest in preferences.get('interests', []) or []:
+            for category, weight in INTEREST_CATEGORY_MAP.get(interest, {}).items():
+                category_votes[category] += weight
+
+        hidden_gem_votes.append(parse_hidden_gem_value(preferences.get('hiddenGemPreference')))
+
+        itinerary_style = behavior.get('itineraryStyle')
+        if itinerary_style:
+            itinerary_style_counter[itinerary_style] += 1
+
+        route_priority = behavior.get('routePriority')
+        if route_priority:
+            route_priority_counter[route_priority] += 1
+
+        for suggestion in (feedback.get('suggestions') or '').replace(';', ',').split(','):
+            normalized = normalize_text(suggestion)
+            if normalized and normalized not in GENERIC_SURVEY_WORDS:
+                suggestion_terms[normalized] += 1
+
+        tourist_trap = normalize_text(feedback.get('touristTrap'))
+        if tourist_trap and tourist_trap not in GENERIC_SURVEY_WORDS:
+            tourist_trap_terms[tourist_trap] += 1
+
+    max_category_vote = max(category_votes.values(), default=1)
+    category_weights = {
+        category: 1.0 + (vote / max_category_vote) * 2.25
+        for category, vote in category_votes.items()
+    }
+
+    quality_preference_votes = itinerary_style_counter.get(
+        'Visit 3 high-quality locations far apart (Quality over Distance)',
+        0,
+    )
+    experience_priority_votes = route_priority_counter.get(
+        'Best Experience (Visit the most highly-rated places regardless of distance)',
+        0,
+    )
+
+    return {
+        'category_weights': category_weights,
+        'hidden_gem_bias': sum(hidden_gem_votes) / max(len(hidden_gem_votes), 1) / 5,
+        'quality_bias': quality_preference_votes / max(sum(itinerary_style_counter.values()), 1),
+        'experience_bias': experience_priority_votes / max(sum(route_priority_counter.values()), 1),
+        'suggestion_terms': suggestion_terms,
+        'tourist_trap_terms': tourist_trap_terms,
+    }
+
+
+def survey_match_bonus(place: Dict[str, object], term_counter: Counter) -> float:
+    if not term_counter:
+        return 0.0
+
+    haystack = ' '.join(
+        [
+            normalize_text(place.get('name')),
+            normalize_text(place.get('area')),
+            normalize_text(place.get('category')),
+            normalize_text(place.get('description')),
+        ]
+    )
+
+    bonus = 0.0
+    for term, count in term_counter.items():
+        if term in haystack:
+            bonus += min(1.4, 0.35 * count)
+    return bonus
+
+
+def score_place(
+    place: Dict[str, object],
+    request: ItineraryRequest,
+    survey_profile: Dict[str, object],
+) -> float:
+    settings = travel_settings(request.preference, survey_profile)
+    category_weights = survey_profile.get('category_weights', {})
+    hidden_gem_bias = float(survey_profile.get('hidden_gem_bias', 0.6))
+
+    score = 0.0
+    score += 6.0 if request.is_auto_generated and place.get('top') else 0.0
+    score += 2.2 if place.get('top') else 1.0
+    score += float(category_weights.get(place.get('category'), 1.0))
+
+    if place.get('hidden'):
+        score += 1.0 * hidden_gem_bias
+    elif not place.get('top') and hidden_gem_bias >= 0.65:
+        score += 0.35
+
+    day_budget = request.budget / max(request.days, 1)
+    ideal_place_budget = request.budget / max(request.days * int(settings['target_stops']), 1)
+    cost = int(place.get('cost', 0))
+
+    if cost == 0:
+        score += 1.6
+    elif cost <= ideal_place_budget:
+        score += 2.2
+    elif cost <= ideal_place_budget * 1.6:
+        score += 1.0
+    elif cost <= day_budget * 0.85:
+        score -= 0.2
+    else:
+        score -= 2.4
+
+    ideal_stop_hours = float(settings['hours_per_day']) / max(int(settings['target_stops']), 1)
+    duration = float(place.get('duration', 0))
+    if duration <= ideal_stop_hours * 1.15:
+        score += 1.35
+    elif duration <= float(settings['hours_per_day']) * 0.8:
+        score += 0.55
+    else:
+        score -= 1.4
+
+    if request.preference == 'relaxed':
+        if place.get('category') in {'nature', 'beach', 'heritage', 'temple'}:
+            score += 0.7
+        if duration >= 2:
+            score += 0.4
+    elif request.preference == 'discovery':
+        if place.get('category') in {'beach', 'temple', 'heritage', 'nature'}:
+            score += 0.75
+        if place.get('top'):
+            score += 0.65
+
+    score += survey_match_bonus(place, survey_profile.get('suggestion_terms', Counter()))
+    score -= survey_match_bonus(place, survey_profile.get('tourist_trap_terms', Counter())) * 0.7
+
+    return round(score, 4)
+
+
+def choose_day_seed(
+    remaining_places: List[Dict[str, object]],
+    previous_anchor: Optional[List[float]],
+    request: ItineraryRequest,
+    settings: Dict[str, float],
+) -> Optional[Dict[str, object]]:
+    if not remaining_places:
+        return None
+
+    auto_pool = [place for place in remaining_places if place.get('top')] if request.is_auto_generated else []
+    candidate_pool = auto_pool or remaining_places
+
+    def seed_score(place: Dict[str, object]) -> float:
+        base_score = float(place['_planner_score'])
+        if previous_anchor:
+            base_score -= calculate_distance(previous_anchor, place.get('coordinates')) * float(settings['seed_penalty'])
+        return base_score
+
+    return max(candidate_pool, key=seed_score)
+
+
+def pick_next_place_for_day(
+    remaining_places: List[Dict[str, object]],
+    day_places: List[Dict[str, object]],
+    remaining_budget: int,
+    hours_used: float,
+    settings: Dict[str, float],
+    request: ItineraryRequest,
+) -> Optional[Dict[str, object]]:
+    if not remaining_places:
+        return None
+
+    last_coordinates = day_places[-1].get('coordinates') if day_places else None
+    last_area = normalize_text(day_places[-1].get('area')) if day_places else ''
+    max_hours = float(settings['hours_per_day']) + (1.4 if not day_places else 0.8)
+    candidates = []
+
+    for place in remaining_places:
+        cost = int(place.get('cost', 0))
+        duration = float(place.get('duration', 0))
+        if cost > remaining_budget or hours_used + duration > max_hours:
+            continue
+
+        candidate_score = float(place['_planner_score'])
+        if last_coordinates:
+            distance = calculate_distance(last_coordinates, place.get('coordinates'))
+            candidate_score -= distance * float(settings['hop_penalty'])
+            if normalize_text(place.get('area')) == last_area:
+                candidate_score += 0.8
+            if place.get('category') != day_places[-1].get('category'):
+                candidate_score += 0.25
+        else:
+            if request.is_auto_generated and place.get('top'):
+                candidate_score += 0.6
+
+        if len(day_places) + 1 >= int(settings['target_stops']) and hours_used + duration > float(settings['hours_per_day']):
+            candidate_score -= 0.75
+
+        candidates.append((candidate_score, place))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def pick_food_place_for_day(
+    remaining_food_places: List[Dict[str, object]],
+    day_places: List[Dict[str, object]],
+    remaining_budget: int,
+    hours_used: float,
+    settings: Dict[str, float],
+) -> Optional[Dict[str, object]]:
+    if not remaining_food_places:
+        return None
+
+    max_hours = float(settings['hours_per_day']) + 0.5
+    day_coordinates = [place.get('coordinates') for place in day_places if place.get('coordinates')]
+    day_areas = {normalize_text(place.get('area')) for place in day_places if place.get('area')}
+    candidates = []
+
+    for place in remaining_food_places:
+        cost = int(place.get('cost', 0))
+        duration = float(place.get('duration', 0))
+        if cost > remaining_budget or hours_used + duration > max_hours:
+            continue
+
+        candidate_score = float(place['_planner_score'])
+        candidate_score += 0.95 if place.get('top') else 0.3
+
+        if day_coordinates:
+            closest_distance = min(
+                calculate_distance(day_coordinate, place.get('coordinates'))
+                for day_coordinate in day_coordinates
+            )
+            candidate_score -= closest_distance * float(settings['hop_penalty']) * 0.7
+
+            if closest_distance <= 2:
+                candidate_score += 1.15
+            elif closest_distance <= 5:
+                candidate_score += 0.7
+            elif closest_distance <= 8:
+                candidate_score += 0.25
+
+        if normalize_text(place.get('area')) in day_areas:
+            candidate_score += 0.85
+
+        candidates.append((candidate_score, place))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def build_day_itineraries(
+    places: List[Dict[str, object]],
+    request: ItineraryRequest,
+    survey_profile: Dict[str, object],
+) -> List[DayItinerary]:
+    settings = travel_settings(request.preference, survey_profile)
+    remaining_places = sorted(places, key=lambda place: place['_planner_score'], reverse=True)
+    remaining_food_places = [place for place in remaining_places if place.get('category') == FOOD_CATEGORY]
+    remaining_core_places = [place for place in remaining_places if place.get('category') != FOOD_CATEGORY]
+    remaining_budget = request.budget
+    previous_anchor = None
+    itinerary_days: List[DayItinerary] = []
+
+    for day_number in range(1, request.days + 1):
+        if not remaining_core_places and not remaining_food_places:
+            break
+
+        day_places: List[Dict[str, object]] = []
+        day_cost = 0
+        day_duration = 0.0
+        food_added = False
+
+        seed_pool = remaining_core_places or remaining_food_places
+        seed = choose_day_seed(seed_pool, previous_anchor, request, settings)
+        if seed and int(seed.get('cost', 0)) <= remaining_budget:
+            day_places.append(seed)
+            day_cost += int(seed.get('cost', 0))
+            day_duration += float(seed.get('duration', 0))
+            remaining_budget -= int(seed.get('cost', 0))
+            if seed.get('category') == FOOD_CATEGORY:
+                food_added = True
+                remaining_food_places = [place for place in remaining_food_places if place['id'] != seed['id']]
+            else:
+                remaining_core_places = [place for place in remaining_core_places if place['id'] != seed['id']]
+
+        if day_places and not food_added:
+            food_place = pick_food_place_for_day(
+                remaining_food_places,
+                day_places,
+                remaining_budget,
+                day_duration,
+                settings,
+            )
+            if food_place:
+                day_places.append(food_place)
+                day_cost += int(food_place.get('cost', 0))
+                day_duration += float(food_place.get('duration', 0))
+                remaining_budget -= int(food_place.get('cost', 0))
+                remaining_food_places = [
+                    place for place in remaining_food_places if place['id'] != food_place['id']
+                ]
+                food_added = True
+
+        while remaining_core_places:
+            if len(day_places) >= int(settings['hard_stop_limit']):
+                break
+
+            next_place = pick_next_place_for_day(
+                remaining_core_places,
+                day_places,
+                remaining_budget,
+                day_duration,
+                settings,
+                request,
+            )
+            if not next_place:
+                break
+
+            day_places.append(next_place)
+            day_cost += int(next_place.get('cost', 0))
+            day_duration += float(next_place.get('duration', 0))
+            remaining_budget -= int(next_place.get('cost', 0))
+            remaining_core_places = [place for place in remaining_core_places if place['id'] != next_place['id']]
+
+            if (
+                len(day_places) >= int(settings['target_stops'])
+                and day_duration >= float(settings['soft_stop_hours'])
+            ):
+                break
+
+        if day_places and not food_added:
+            food_place = pick_food_place_for_day(
+                remaining_food_places,
+                day_places,
+                remaining_budget,
+                day_duration,
+                settings,
+            )
+            if food_place:
+                day_places.append(food_place)
+                day_cost += int(food_place.get('cost', 0))
+                day_duration += float(food_place.get('duration', 0))
+                remaining_budget -= int(food_place.get('cost', 0))
+                remaining_food_places = [
+                    place for place in remaining_food_places if place['id'] != food_place['id']
+                ]
+
+        if day_places:
+            previous_anchor = day_places[-1].get('coordinates')
+            itinerary_days.append(
+                DayItinerary(
+                    day=day_number,
+                    places=day_places,
+                    total_cost=day_cost,
+                    total_duration=round(day_duration, 1),
+                )
+            )
+
+    return itinerary_days
+
+
+def get_recommendations(
+    all_ranked_places: List[Dict[str, object]],
+    used_place_ids: set[str],
+) -> List[Dict[str, object]]:
+    recommendations = []
+    for place in all_ranked_places:
+        if place['id'] in used_place_ids:
+            continue
+        recommendations.append(place)
+        if len(recommendations) == 4:
+            break
+    return recommendations
+
+
+# --- API Routes ---
 
 @api_router.get("/places", response_model=List[PlaceResponse])
 async def get_places(
@@ -87,7 +537,6 @@ async def get_places(
     search: Optional[str] = None
 ):
     query = {}
-    
     if category and category != "all":
         query["category"] = category
     if type and type != "all":
@@ -98,215 +547,111 @@ async def get_places(
         query["hidden"] = hidden
     if search:
         query["name"] = {"$regex": search, "$options": "i"}
-    
-    places = await db.places.find(query, {"_id": 0}).to_list(1000)
-    return places
 
-@api_router.get("/places/{place_id}", response_model=PlaceResponse)
-async def get_place(place_id: str):
-    place = await db.places.find_one({"id": place_id}, {"_id": 0})
-    if not place:
-        raise HTTPException(status_code=404, detail="Place not found")
-    return place
+    return await db.places.find(query, {"_id": 0}).to_list(1000)
+
 
 @api_router.post("/generate-itinerary", response_model=ItineraryResponse)
 async def generate_itinerary(request: ItineraryRequest):
-    # Fetch all selected places
-    places = await db.places.find(
-        {"id": {"$in": request.place_ids}},
-        {"_id": 0}
-    ).to_list(1000)
-    
-    if not places:
-        raise HTTPException(status_code=400, detail="No valid places found")
-    
-    # Filter places within budget
-    total_cost = sum(p["cost"] for p in places)
-    if total_cost > request.budget:
-        # Sort by priority (top picks first) and cost
-        places.sort(key=lambda x: (not x.get("top", False), x["cost"]))
-        
-        # Select places within budget
-        selected = []
-        current_cost = 0
-        for place in places:
-            if current_cost + place["cost"] <= request.budget:
-                selected.append(place)
-                current_cost += place["cost"]
-        places = selected
-    
-    if not places:
-        raise HTTPException(status_code=400, detail="No places fit within budget")
-    
-    # Group places by area proximity
-    area_groups = {}
-    for place in places:
-        area = place["area"]
-        if area not in area_groups:
-            area_groups[area] = []
-        area_groups[area].append(place)
-    
-    # Distribute places across days
-    days = request.days
-    places_per_day = len(places) / days
-    
-    # Adjust based on preference
-    if request.preference == "relaxed":
-        places_per_day = max(1, places_per_day * 0.7)
-    elif request.preference == "packed":
-        places_per_day = places_per_day * 1.3
-    
-    day_itineraries = []
-    remaining_places = places.copy()
-    
-    for day_num in range(1, days + 1):
-        if not remaining_places:
-            break
-        
-        # Calculate how many places for this day
-        num_places = int(places_per_day) if day_num < days else len(remaining_places)
-        num_places = min(num_places, len(remaining_places))
-        
-        # Select places for this day (try to group by area)
-        day_places = []
-        used_indices = []
-        
-        # Try to group by area
-        if remaining_places:
-            first_place = remaining_places[0]
-            day_places.append(first_place)
-            used_indices.append(0)
-            
-            # Find nearby places
-            for i, place in enumerate(remaining_places[1:], 1):
-                if len(day_places) >= num_places:
-                    break
-                if place["area"] == first_place["area"] or len(day_places) < num_places:
-                    day_places.append(place)
-                    used_indices.append(i)
-        
-        # Remove used places
-        for idx in sorted(used_indices, reverse=True):
-            remaining_places.pop(idx)
-        
-        day_cost = sum(p["cost"] for p in day_places)
-        day_duration = sum(p["duration"] for p in day_places)
-        
-        day_itineraries.append(DayItinerary(
-            day=day_num,
-            places=day_places,
-            total_cost=day_cost,
-            total_duration=day_duration
-        ))
-    
-    total_cost = sum(d.total_cost for d in day_itineraries)
-    total_duration = sum(d.total_duration for d in day_itineraries)
-    
-    # Generate recommendations (nearby places not in cart)
-    selected_ids = [p["id"] for p in places]
-    recommendations = await db.places.find(
-        {"id": {"$nin": selected_ids}, "top": True},
-        {"_id": 0}
-    ).limit(5).to_list(5)
-    
+    if request.days < 1 or request.days > 30:
+        raise HTTPException(status_code=400, detail="Days must be between 1 and 30")
+    if request.budget <= 0:
+        raise HTTPException(status_code=400, detail="Budget must be greater than 0")
+
+    if request.is_auto_generated or not request.place_ids:
+        selected_places = await db.places.find({}, {"_id": 0}).to_list(1000)
+    else:
+        selected_places = await db.places.find({"id": {"$in": request.place_ids}}, {"_id": 0}).to_list(1000)
+
+    if not selected_places:
+        raise HTTPException(status_code=404, detail="No matching places were found in the database")
+
+    survey_profile = await get_survey_profile()
+    ranked_places = []
+    for place in selected_places:
+        ranked_place = dict(place)
+        ranked_place['_planner_score'] = score_place(ranked_place, request, survey_profile)
+        ranked_places.append(ranked_place)
+
+    ranked_places.sort(key=lambda place: place['_planner_score'], reverse=True)
+    day_itineraries = build_day_itineraries(ranked_places, request, survey_profile)
+
+    if not day_itineraries:
+        raise HTTPException(
+            status_code=400,
+            detail="The current budget and day count could not fit a workable itinerary. Try increasing the budget or reducing the days.",
+        )
+
+    used_place_ids = {
+        place.id
+        for day in day_itineraries
+        for place in day.places
+    }
+    recommendations = get_recommendations(ranked_places, used_place_ids)
+
     return ItineraryResponse(
         days=day_itineraries,
-        total_cost=total_cost,
-        total_duration=total_duration,
-        recommendations=recommendations
+        total_cost=sum(day.total_cost for day in day_itineraries),
+        total_duration=round(sum(day.total_duration for day in day_itineraries), 1),
+        recommendations=recommendations,
     )
 
-# Include the router in the main app
+
+# --- App Setup ---
+
 app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
 
 @app.on_event("startup")
-async def seed_database():
-    """Seed the database with Trivandrum places if empty"""
-    count = await db.places.count_documents({})
-    if count == 0:
-        logger.info("Seeding database with Trivandrum places...")
-        places_data = [
-            # TEMPLES
-            {"id": str(uuid.uuid4()), "name": "Sree Padmanabhaswamy Temple", "category": "temple", "area": "East Fort", "description": "One of the richest temples in the world, dedicated to Lord Vishnu. Built in Dravidian architecture with intricate gopuram and located inside East Fort.", "top": True, "hidden": False, "type": None, "cost": 0, "duration": 1.5, "coordinates": [8.4839, 76.9496], "image_url": "https://images.unsplash.com/photo-1644773182167-0d302480d813"},
-            {"id": str(uuid.uuid4()), "name": "Attukal Bhagavathy Temple", "category": "temple", "area": "Attukal", "description": "Famous for the Attukal Pongala festival, which holds the Guinness World Record for largest gathering of women. Dedicated to Goddess Bhagavathy.", "top": True, "hidden": False, "type": None, "cost": 0, "duration": 1.0, "coordinates": [8.5, 76.97], "image_url": "https://images.unsplash.com/photo-1644773182167-0d302480d813"},
-            {"id": str(uuid.uuid4()), "name": "Pazhavangadi Ganapathy Temple", "category": "temple", "area": "East Fort", "description": "Ancient Ganesha temple located near the East Fort. Known for its powerful deity and peaceful atmosphere.", "top": False, "hidden": False, "type": None, "cost": 0, "duration": 0.5, "coordinates": [8.486, 76.951], "image_url": "https://images.unsplash.com/photo-1644773182167-0d302480d813"},
-            {"id": str(uuid.uuid4()), "name": "Aazhimala Shiva Temple", "category": "temple", "area": "Vizhinjam", "description": "Scenic temple on a cliff overlooking the Arabian Sea. Offers breathtaking ocean views and spiritual tranquility.", "top": True, "hidden": False, "type": None, "cost": 50, "duration": 1.5, "coordinates": [8.38, 76.98], "image_url": "https://images.unsplash.com/photo-1644773182167-0d302480d813"},
-            {"id": str(uuid.uuid4()), "name": "Janardhana Swamy Temple", "category": "temple", "area": "Varkala", "description": "2000-year-old temple dedicated to Lord Vishnu, located near Varkala Beach. An important pilgrimage site.", "top": True, "hidden": False, "type": None, "cost": 0, "duration": 1.0, "coordinates": [8.738, 76.716], "image_url": "https://images.unsplash.com/photo-1644773182167-0d302480d813"},
-            {"id": str(uuid.uuid4()), "name": "Karikkakom Chamundi Temple", "category": "temple", "area": "Karikkakom", "description": "Historic temple dedicated to Goddess Chamundi. Known for its traditional Kerala architecture and annual festival.", "top": False, "hidden": False, "type": None, "cost": 0, "duration": 0.5, "coordinates": [8.53, 76.94], "image_url": "https://images.unsplash.com/photo-1644773182167-0d302480d813"},
-            
-            # CHURCHES
-            {"id": str(uuid.uuid4()), "name": "St Joseph Cathedral Palayam", "category": "church", "area": "Palayam", "description": "Beautiful neo-Gothic Catholic cathedral built in 1873. Features stunning stained glass windows and peaceful ambiance.", "top": False, "hidden": False, "type": None, "cost": 0, "duration": 0.5, "coordinates": [8.506, 76.956], "image_url": "https://images.pexels.com/photos/32542538/pexels-photo-32542538.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Vettucaud Church", "category": "church", "area": "Vettucaud", "description": "Historic coastal church with serene atmosphere. Popular among locals and offers beautiful views of the sea.", "top": False, "hidden": False, "type": None, "cost": 0, "duration": 0.5, "coordinates": [8.47, 76.95], "image_url": "https://images.pexels.com/photos/32542538/pexels-photo-32542538.jpeg"},
-            
-            # MOSQUES
-            {"id": str(uuid.uuid4()), "name": "Palayam Juma Masjid", "category": "mosque", "area": "Palayam", "description": "Historic mosque in the heart of the city. Known for its traditional architecture and communal harmony.", "top": False, "hidden": False, "type": None, "cost": 0, "duration": 0.5, "coordinates": [8.507, 76.957], "image_url": "https://images.pexels.com/photos/32542538/pexels-photo-32542538.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Beemapally Mosque", "category": "mosque", "area": "Beemapally", "description": "16th-century mosque and dargah. Famous for the annual Beemapally Uroos festival celebrated by people of all faiths.", "top": False, "hidden": False, "type": None, "cost": 0, "duration": 1.0, "coordinates": [8.47, 76.94], "image_url": "https://images.pexels.com/photos/32542538/pexels-photo-32542538.jpeg"},
-            
-            # BEACHES
-            {"id": str(uuid.uuid4()), "name": "Kovalam Beach", "category": "beach", "area": "Kovalam", "description": "Internationally famous crescent-shaped beach with lighthouse, water sports, and stunning sunset views. Perfect for swimming and relaxation.", "top": True, "hidden": False, "type": None, "cost": 0, "duration": 3.0, "coordinates": [8.4, 76.979], "image_url": "https://images.unsplash.com/photo-1695030744519-3f3042b3af26"},
-            {"id": str(uuid.uuid4()), "name": "Varkala Cliff Beach", "category": "beach", "area": "Varkala", "description": "Unique beach with dramatic red cliffs, natural springs, and vibrant cafes. Known as Papanasam Beach for its spiritual significance.", "top": True, "hidden": False, "type": None, "cost": 50, "duration": 3.0, "coordinates": [8.738, 76.716], "image_url": "https://images.unsplash.com/photo-1695030744519-3f3042b3af26"},
-            {"id": str(uuid.uuid4()), "name": "Shankumugham Beach", "category": "beach", "area": "Shankumugham", "description": "Popular sunset beach near the airport. Features a massive mermaid sculpture and evening food stalls.", "top": False, "hidden": False, "type": None, "cost": 0, "duration": 2.0, "coordinates": [8.475, 76.923], "image_url": "https://images.unsplash.com/photo-1695030744519-3f3042b3af26"},
-            {"id": str(uuid.uuid4()), "name": "Poovar Beach", "category": "beach", "area": "Poovar", "description": "Pristine golden sand beach where the Neyyar River meets the Arabian Sea. Known for its tranquil backwaters and boat rides.", "top": True, "hidden": False, "type": None, "cost": 200, "duration": 3.0, "coordinates": [8.315, 77.072], "image_url": "https://images.unsplash.com/photo-1695030744519-3f3042b3af26"},
-            {"id": str(uuid.uuid4()), "name": "Chowara Beach", "category": "beach", "area": "Chowara", "description": "Secluded beach perfect for ayurvedic retreats and peaceful relaxation. Less crowded than Kovalam.", "top": False, "hidden": False, "type": None, "cost": 0, "duration": 2.0, "coordinates": [8.365, 76.995], "image_url": "https://images.unsplash.com/photo-1695030744519-3f3042b3af26"},
-            {"id": str(uuid.uuid4()), "name": "Veli Beach", "category": "beach", "area": "Veli", "description": "Beach with a scenic lagoon where backwaters meet the sea. Offers boating and water sports facilities.", "top": False, "hidden": False, "type": None, "cost": 100, "duration": 2.0, "coordinates": [8.463, 76.914], "image_url": "https://images.unsplash.com/photo-1695030744519-3f3042b3af26"},
-            
-            # HERITAGE
-            {"id": str(uuid.uuid4()), "name": "Napier Museum", "category": "heritage", "area": "Museum Road", "description": "19th-century museum showcasing Kerala's rich cultural and artistic heritage. Features natural history and archaeological artifacts.", "top": True, "hidden": False, "type": None, "cost": 20, "duration": 1.5, "coordinates": [8.501, 76.956], "image_url": "https://images.pexels.com/photos/19934600/pexels-photo-19934600.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Kuthiramalika Palace", "category": "heritage", "area": "East Fort", "description": "Royal palace built by Maharaja Swathi Thirunal. Features 122 wooden horses and exquisite Kerala architecture.", "top": True, "hidden": False, "type": None, "cost": 50, "duration": 1.0, "coordinates": [8.483, 76.949], "image_url": "https://images.pexels.com/photos/19934600/pexels-photo-19934600.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Sri Chitra Art Gallery", "category": "heritage", "area": "Museum Road", "description": "Premier art gallery displaying works by Raja Ravi Varma and other renowned artists. Houses Mughal, Rajput, and Tanjore paintings.", "top": True, "hidden": False, "type": None, "cost": 20, "duration": 1.0, "coordinates": [8.502, 76.957], "image_url": "https://images.pexels.com/photos/19934600/pexels-photo-19934600.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Kanakakkunnu Palace", "category": "heritage", "area": "Museum Road", "description": "'Palace of Gold' with beautiful gardens. Now used as a venue for cultural events and conferences.", "top": False, "hidden": False, "type": None, "cost": 20, "duration": 1.0, "coordinates": [8.504, 76.954], "image_url": "https://images.pexels.com/photos/19934600/pexels-photo-19934600.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Padmanabhapuram Palace", "category": "heritage", "area": "Near TVM", "description": "Magnificent wooden palace of the Travancore rulers. Features intricate carvings, murals, and traditional Kerala architecture.", "top": True, "hidden": False, "type": None, "cost": 50, "duration": 2.0, "coordinates": [8.244, 77.325], "image_url": "https://images.pexels.com/photos/19934600/pexels-photo-19934600.jpeg"},
-            
-            # NATURE
-            {"id": str(uuid.uuid4()), "name": "Ponmudi Hills", "category": "nature", "area": "Ponmudi", "description": "Hill station at 1100m altitude with tea gardens, winding roads, and cool climate. Perfect for trekking and nature walks.", "top": True, "hidden": False, "type": None, "cost": 0, "duration": 6.0, "coordinates": [8.762, 77.109], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            {"id": str(uuid.uuid4()), "name": "Neyyar Dam", "category": "nature", "area": "Neyyar", "description": "Scenic dam with boating facilities, surrounded by lush forests. Home to a lion safari park and deer park.", "top": True, "hidden": False, "type": None, "cost": 100, "duration": 3.0, "coordinates": [8.526, 77.176], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            {"id": str(uuid.uuid4()), "name": "Peppara Wildlife Sanctuary", "category": "nature", "area": "Peppara", "description": "Wildlife sanctuary with diverse flora and fauna. Ideal for wildlife photography and nature enthusiasts.", "top": False, "hidden": False, "type": None, "cost": 50, "duration": 4.0, "coordinates": [8.617, 77.168], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            {"id": str(uuid.uuid4()), "name": "Akkulam Lake", "category": "nature", "area": "Akkulam", "description": "Serene lake with boating facilities and children's park. Popular picnic spot for families.", "top": False, "hidden": False, "type": None, "cost": 50, "duration": 2.0, "coordinates": [8.518, 76.952], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            {"id": str(uuid.uuid4()), "name": "Veli Tourist Village", "category": "nature", "area": "Veli", "description": "Tourist village where Veli Lake meets the Arabian Sea. Offers boat rides, floating bridge, and water activities.", "top": False, "hidden": False, "type": None, "cost": 100, "duration": 2.5, "coordinates": [8.464, 76.915], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            
-            # MARKETS
-            {"id": str(uuid.uuid4()), "name": "Chalai Market", "category": "market", "area": "East Fort", "description": "Bustling traditional market for local shopping. Find spices, textiles, jewelry, and authentic Kerala products.", "top": True, "hidden": False, "type": None, "cost": 0, "duration": 1.5, "coordinates": [8.489, 76.951], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            {"id": str(uuid.uuid4()), "name": "Lulu Mall", "category": "market", "area": "Akkulam", "description": "One of India's largest shopping malls. Features international brands, food courts, cinema, and entertainment zones.", "top": True, "hidden": False, "type": None, "cost": 0, "duration": 3.0, "coordinates": [8.519, 76.953], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            {"id": str(uuid.uuid4()), "name": "Mall of Travancore", "category": "market", "area": "Chackai", "description": "Modern shopping mall with retail outlets, multiplex cinema, and dining options.", "top": False, "hidden": False, "type": None, "cost": 0, "duration": 2.0, "coordinates": [8.52, 76.96], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            {"id": str(uuid.uuid4()), "name": "MG Road", "category": "market", "area": "Statue", "description": "Main shopping street with clothing stores, electronics, and local businesses. Heart of city's commercial activity.", "top": False, "hidden": False, "type": None, "cost": 0, "duration": 2.0, "coordinates": [8.507, 76.952], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            
-            # FOOD
-            {"id": str(uuid.uuid4()), "name": "Zam Zam Restaurant", "category": "food", "area": "Palayam", "description": "Iconic restaurant famous for authentic Malabar biryani and traditional Kerala cuisine. A must-visit for food lovers.", "top": True, "hidden": False, "type": "local", "cost": 300, "duration": 1.0, "coordinates": [8.506, 76.957], "image_url": "https://images.pexels.com/photos/14132112/pexels-photo-14132112.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Paragon Restaurant TVM", "category": "food", "area": "Kesavadasapuram", "description": "Legendary restaurant chain serving delicious seafood and Kerala specialties. Known for fish curry and appam.", "top": True, "hidden": False, "type": "local", "cost": 400, "duration": 1.0, "coordinates": [8.524, 76.939], "image_url": "https://images.pexels.com/photos/14132112/pexels-photo-14132112.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Villa Maya", "category": "food", "area": "East Fort", "description": "Fine dining in a restored 18th-century Dutch manor. Offers fusion Kerala cuisine in an elegant heritage setting.", "top": True, "hidden": False, "type": "premium", "cost": 1000, "duration": 2.0, "coordinates": [8.486, 76.951], "image_url": "https://images.pexels.com/photos/14132112/pexels-photo-14132112.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Azad Restaurant", "category": "food", "area": "Statue", "description": "Popular eatery for North Indian and Mughlai dishes. Famous for butter chicken and naan.", "top": True, "hidden": False, "type": "local", "cost": 350, "duration": 1.0, "coordinates": [8.507, 76.952], "image_url": "https://images.pexels.com/photos/14132112/pexels-photo-14132112.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Indian Coffee House", "category": "food", "area": "Statue", "description": "Iconic coffee house with unique spiral architecture. Serves filter coffee, dosas, and traditional snacks at budget prices.", "top": False, "hidden": False, "type": "budget", "cost": 100, "duration": 0.5, "coordinates": [8.508, 76.952], "image_url": "https://images.pexels.com/photos/14132112/pexels-photo-14132112.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Cafe Mojo", "category": "food", "area": "Vazhuthacaud", "description": "Trendy cafe with modern ambiance. Great for coffee, smoothies, and continental food.", "top": False, "hidden": False, "type": "cafe", "cost": 250, "duration": 1.0, "coordinates": [8.521, 76.954], "image_url": "https://images.pexels.com/photos/14132112/pexels-photo-14132112.jpeg"},
-            
-            # CULTURE
-            {"id": str(uuid.uuid4()), "name": "Nishagandhi Open Air Theatre", "category": "culture", "area": "Kanakakkunnu", "description": "Open-air auditorium hosting classical dance and music performances. Part of the Nishagandhi Dance Festival.", "top": False, "hidden": False, "type": None, "cost": 200, "duration": 2.0, "coordinates": [8.504, 76.954], "image_url": "https://images.pexels.com/photos/32542538/pexels-photo-32542538.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Priyadarsini Planetarium", "category": "culture", "area": "PMG Junction", "description": "Planetarium with astronomy shows and science exhibitions. Educational and entertaining for all ages.", "top": False, "hidden": False, "type": None, "cost": 50, "duration": 1.5, "coordinates": [8.502, 76.958], "image_url": "https://images.pexels.com/photos/32542538/pexels-photo-32542538.jpeg"},
-            {"id": str(uuid.uuid4()), "name": "Kerala Science & Technology Museum", "category": "culture", "area": "PMG Junction", "description": "Interactive science museum with hands-on exhibits. Perfect for families and curious minds.", "top": False, "hidden": False, "type": None, "cost": 50, "duration": 2.0, "coordinates": [8.502, 76.958], "image_url": "https://images.pexels.com/photos/32542538/pexels-photo-32542538.jpeg"},
-            
-            # STREETS
-            {"id": str(uuid.uuid4()), "name": "Manaveeyam Veedhi", "category": "street", "area": "Vellayambalam", "description": "Pedestrian-friendly street with cafes, bookstores, and art spaces. Great for evening walks and cultural vibes.", "top": True, "hidden": False, "type": None, "cost": 0, "duration": 1.5, "coordinates": [8.512, 76.956], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            {"id": str(uuid.uuid4()), "name": "Kovalam Lighthouse Walk", "category": "street", "area": "Kovalam", "description": "Scenic coastal walk from Lighthouse Beach with stunning views, beach shacks, and sunset spots.", "top": True, "hidden": False, "type": None, "cost": 0, "duration": 2.0, "coordinates": [8.401, 76.978], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
-            {"id": str(uuid.uuid4()), "name": "Varkala Cliff Walk", "category": "street", "area": "Varkala", "description": "Cliff-top walkway lined with cafes, shops, and viewpoints overlooking the beach. Perfect for sunset strolls.", "top": True, "hidden": False, "type": None, "cost": 0, "duration": 2.0, "coordinates": [8.738, 76.716], "image_url": "https://images.unsplash.com/photo-1642219236097-ac751378a901"},
+async def seed_data():
+    if await db.places.count_documents({}) == 0:
+        sample_data = [
+            {
+                "id": str(uuid.uuid4()),
+                "name": "Padmanabhaswamy Temple",
+                "category": "temple",
+                "area": "East Fort",
+                "description": "Historic temple.",
+                "top": True,
+                "hidden": False,
+                "cost": 0,
+                "duration": 2.0,
+                "coordinates": [8.48, 76.94],
+                "image_url": "",
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "name": "Kovalam Beach",
+                "category": "beach",
+                "area": "Kovalam",
+                "description": "Famous beach.",
+                "top": True,
+                "hidden": False,
+                "cost": 0,
+                "duration": 3.0,
+                "coordinates": [8.40, 76.97],
+                "image_url": "",
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "name": "Aazhimala Temple",
+                "category": "temple",
+                "area": "Vizhinjam",
+                "description": "Cliff temple.",
+                "top": False,
+                "hidden": True,
+                "cost": 50,
+                "duration": 1.5,
+                "coordinates": [8.38, 76.98],
+                "image_url": "",
+            },
         ]
-        
-        await db.places.insert_many(places_data)
-        logger.info(f"Seeded {len(places_data)} places to database")
+        await db.places.insert_many(sample_data)

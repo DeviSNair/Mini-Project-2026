@@ -1,6 +1,7 @@
 import { motion } from 'framer-motion';
 import { MapPin, ShoppingBag, Check } from 'lucide-react';
 import { useCart } from '@/context/CartContext';
+import { PlaceImage } from '@/components/PlaceImage';
 import { toast } from 'sonner';
 
 export const PlaceCard = ({ place, index }) => {
@@ -25,9 +26,8 @@ export const PlaceCard = ({ place, index }) => {
       data-testid={`place-card-${place.id}`}
     >
       <div className="relative h-48 overflow-hidden">
-        <img
-          src={place.image_url}
-          alt={place.name}
+        <PlaceImage
+          place={place}
           className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
         />
         <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent" />

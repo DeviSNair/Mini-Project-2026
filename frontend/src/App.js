@@ -12,7 +12,7 @@ function App() {
   return (
     <CartProvider>
       <BrowserRouter>
-        <div className="App">
+        <div className="App min-h-screen aurora-page">
           <Navbar />
           <Routes>
             <Route path="/" element={<HomePage />} />

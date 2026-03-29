@@ -7,8 +7,9 @@ import { Input } from '@/components/ui/input';
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
+// Replace the lines with these:
+const BACKEND_URL = "http://127.0.0.1:8000";
+const API = `${BACKEND_URL}`;
 
 export const ExplorePage = () => {
   const [places, setPlaces] = useState([]);
@@ -93,13 +94,13 @@ export const ExplorePage = () => {
   };
 
   return (
-    <div className="min-h-screen pt-24 pb-12 bg-[#FDFBF7]">
+    <div className="page-shell min-h-screen aurora-page pt-24 pb-14">
       <div className="container mx-auto px-4 sm:px-6 lg:px-8">
         {/* Header */}
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
-          className="text-center mb-12"
+          className="glass-panel mb-8 rounded-[2rem] px-6 py-10 text-center sm:px-10"
         >
           <h1
             className="text-4xl sm:text-5xl lg:text-6xl font-bold text-[#004D40] mb-4"
@@ -118,16 +119,16 @@ export const ExplorePage = () => {
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.1 }}
-          className="max-w-2xl mx-auto mb-8"
+          className="mx-auto mb-8 max-w-2xl"
         >
-          <div className="relative">
+          <div className="glass-panel relative rounded-[2rem] p-3">
             <Search className="absolute left-4 top-1/2 transform -translate-y-1/2 w-5 h-5 text-[#5C5C5C]" />
             <Input
               type="text"
               placeholder="Search any place..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="pl-12 pr-4 py-6 text-lg rounded-full border-2 border-[#E5E0D8] focus:border-[#FFB300] focus:ring-[#FFB300]"
+              className="pl-12 pr-4 py-6 text-lg rounded-full border-2 border-[#E5E0D8] bg-white/90 focus:border-[#FFB300] focus:ring-[#FFB300]"
               data-testid="search-input"
             />
           </div>
